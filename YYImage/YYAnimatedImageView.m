@@ -11,6 +11,7 @@
 
 #import "YYAnimatedImageView.h"
 #import "YYImageCoder.h"
+#import "YYGlobalAnimatedImageManager.h"
 #import <pthread.h>
 #import <mach/mach.h>
 
@@ -233,13 +234,16 @@ typedef NS_ENUM(NSUInteger, YYAnimatedImageType) {
     if (!_link) {
         _lock = dispatch_semaphore_create(1);
         _buffer = [NSMutableDictionary new];
-        _requestQueue = [[NSOperationQueue alloc] init];
-        _requestQueue.maxConcurrentOperationCount = 1;
+        // 使用全局管理器的解码队列而不是自己的队列
+        _requestQueue = [[YYGlobalAnimatedImageManager sharedManager] globalDecodeQueue];
         _link = [CADisplayLink displayLinkWithTarget:[_YYImageWeakProxy proxyWithTarget:self] selector:@selector(step:)];
         if (_runloopMode) {
             [_link addToRunLoop:[NSRunLoop mainRunLoop] forMode:_runloopMode];
         }
         _link.paused = YES;
+        
+        // 注册到全局管理器
+        [[YYGlobalAnimatedImageManager sharedManager] registerAnimatedImageView:self];
         
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(didReceiveMemoryWarning:) name:UIApplicationDidReceiveMemoryWarningNotification object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(didEnterBackground:) name:UIApplicationDidEnterBackgroundNotification object:nil];
@@ -381,11 +385,12 @@ typedef NS_ENUM(NSUInteger, YYAnimatedImageType) {
     int64_t bytes = (int64_t)_curAnimatedImage.animatedImageBytesPerFrame;
     if (bytes == 0) bytes = 1024;
     
-    int64_t total = _YYDeviceMemoryTotal();
-    int64_t free = _YYDeviceMemoryFree();
-    int64_t max = MIN(total * 0.2, free * 0.6);
-    max = MAX(max, BUFFER_SIZE);
-    if (_maxBufferSize) max = max > _maxBufferSize ? _maxBufferSize : max;
+    // 使用全局管理器推荐的缓存大小
+    NSUInteger recommendedBufferSize = [[YYGlobalAnimatedImageManager sharedManager] recommendedMaxBufferSizeForImageView:self];
+    
+    // 如果用户手动设置了maxBufferSize，优先使用用户设置的值
+    NSUInteger max = _maxBufferSize > 0 ? _maxBufferSize : recommendedBufferSize;
+    
     double maxBufferCount = (double)max / (double)bytes;
     if (maxBufferCount < 1) maxBufferCount = 1;
     else if (maxBufferCount > 512) maxBufferCount = 512;
@@ -393,6 +398,9 @@ typedef NS_ENUM(NSUInteger, YYAnimatedImageType) {
 }
 
 - (void)dealloc {
+    // 从全局管理器注销
+    [[YYGlobalAnimatedImageManager sharedManager] unregisterAnimatedImageView:self];
+    
     [_requestQueue cancelAllOperations];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationDidReceiveMemoryWarningNotification object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationDidEnterBackgroundNotification object:nil];
