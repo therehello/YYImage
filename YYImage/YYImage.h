@@ -28,6 +28,7 @@ FOUNDATION_EXPORT const unsigned char YYImageVersionString[];
 #import "YYSpriteSheetImage.h"
 #import "YYImageCoder.h"
 #import "YYAnimatedImageView.h"
+#import "YYGlobalAnimatedImageManager.h"
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
