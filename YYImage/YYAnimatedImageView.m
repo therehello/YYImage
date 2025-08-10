@@ -11,6 +11,7 @@
 
 #import "YYAnimatedImageView.h"
 #import "YYImageCoder.h"
+#import "YYAnimatedImageCacheManager.h"
 #import <pthread.h>
 #import <mach/mach.h>
 
@@ -145,6 +146,8 @@ typedef NS_ENUM(NSUInteger, YYAnimatedImageType) {
     
     CGRect _curContentsRect;
     BOOL _curImageHasContentsRect; ///< image has implementated "animatedImageContentsRectAtIndex:"
+    
+    NSString *_animatedImageId; ///< unique identifier for cache management
 }
 @property (nonatomic, readwrite) BOOL currentIsPlayingAnimation;
 - (void)calcMaxBufferCount;
@@ -162,6 +165,35 @@ typedef NS_ENUM(NSUInteger, YYAnimatedImageType) {
     __strong YYAnimatedImageView *view = _view;
     if (!view) return;
     if ([self isCancelled]) return;
+    
+    // 检查全局缓存限制
+    YYAnimatedImageCacheManager *cacheManager = [YYAnimatedImageCacheManager sharedManager];
+    if (![cacheManager canCacheMoreFrames:view.animatedImageId additionalFrames:1]) {
+        // 如果全局缓存不足，删除前两帧（除了当前帧和下一帧）
+        LOCK_VIEW(
+            NSArray *keys = view->_buffer.allKeys;
+            NSMutableArray *keysToRemove = [NSMutableArray array];
+            NSUInteger currentIndex = view->_curIndex;
+            NSUInteger nextIndex = (currentIndex + 1) % view->_totalFrameCount;
+            
+            for (NSNumber *key in keys) {
+                NSUInteger frameIndex = [key unsignedIntegerValue];
+                if (frameIndex != currentIndex && frameIndex != nextIndex) {
+                    [keysToRemove addObject:key];
+                    if (keysToRemove.count >= 2) break; // 只删除前两帧
+                }
+            }
+            
+            for (NSNumber *key in keysToRemove) {
+                [view->_buffer removeObjectForKey:key];
+            }
+            
+            // 更新全局缓存管理器
+            [cacheManager updateAnimatedImageCache:view.animatedImageId
+                                  cachedFrameCount:view->_buffer.count];
+        )//LOCK_VIEW
+    }
+    
     view->_incrBufferCount++;
     if (view->_incrBufferCount == 0) [view calcMaxBufferCount];
     if (view->_incrBufferCount > (NSInteger)view->_maxBufferCount) {
@@ -178,6 +210,12 @@ typedef NS_ENUM(NSUInteger, YYAnimatedImageType) {
             if ([self isCancelled]) break;
             __strong YYAnimatedImageView *view = _view;
             if (!view) break;
+            
+            // 再次检查全局缓存限制
+            if (![cacheManager canCacheMoreFrames:view.animatedImageId additionalFrames:1]) {
+                break;
+            }
+            
             LOCK_VIEW(BOOL miss = (view->_buffer[@(idx)] == nil));
             
             if (miss) {
@@ -300,6 +338,32 @@ typedef NS_ENUM(NSUInteger, YYAnimatedImageType) {
     [self imageChanged];
 }
 
+- (NSString *)animatedImageId {
+    if (!_animatedImageId) {
+        _animatedImageId = [NSString stringWithFormat:@"%p", self];
+    }
+    return _animatedImageId;
+}
+
+- (void)setAnimatedImageId:(NSString *)animatedImageId {
+    if (_animatedImageId != animatedImageId) {
+        // 注销旧的缓存
+        if (_animatedImageId && _curAnimatedImage) {
+            [[YYAnimatedImageCacheManager sharedManager] unregisterAnimatedImage:_animatedImageId];
+        }
+        
+        _animatedImageId = [animatedImageId copy];
+        
+        // 注册新的缓存
+        if (_animatedImageId && _curAnimatedImage) {
+            [[YYAnimatedImageCacheManager sharedManager] registerAnimatedImage:_animatedImageId
+                                                                   frameSize:_curAnimatedImage.animatedImageBytesPerFrame
+                                                                  frameCount:_curAnimatedImage.animatedImageFrameCount];
+        }
+    }
+}
+}
+
 - (id)imageForType:(YYAnimatedImageType)type {
     switch (type) {
         case YYAnimatedImageTypeNone: return nil;
@@ -378,18 +442,29 @@ typedef NS_ENUM(NSUInteger, YYAnimatedImageType) {
 
 // dynamically adjust buffer size for current memory.
 - (void)calcMaxBufferCount {
-    int64_t bytes = (int64_t)_curAnimatedImage.animatedImageBytesPerFrame;
-    if (bytes == 0) bytes = 1024;
+    if (!_curAnimatedImage) return;
     
-    int64_t total = _YYDeviceMemoryTotal();
-    int64_t free = _YYDeviceMemoryFree();
-    int64_t max = MIN(total * 0.2, free * 0.6);
-    max = MAX(max, BUFFER_SIZE);
-    if (_maxBufferSize) max = max > _maxBufferSize ? _maxBufferSize : max;
-    double maxBufferCount = (double)max / (double)bytes;
-    if (maxBufferCount < 1) maxBufferCount = 1;
-    else if (maxBufferCount > 512) maxBufferCount = 512;
-    _maxBufferCount = maxBufferCount;
+    // 注册到全局缓存管理器
+    [[YYAnimatedImageCacheManager sharedManager] registerAnimatedImage:self.animatedImageId
+                                                           frameSize:_curAnimatedImage.animatedImageBytesPerFrame
+                                                          frameCount:_curAnimatedImage.animatedImageFrameCount];
+    
+    // 获取建议的缓存帧数
+    NSUInteger suggestedFrames = [[YYAnimatedImageCacheManager sharedManager] suggestedCacheFrameCount:self.animatedImageId];
+    
+    // 应用本地最大缓存大小限制
+    if (_maxBufferSize > 0) {
+        int64_t bytes = (int64_t)_curAnimatedImage.animatedImageBytesPerFrame;
+        if (bytes == 0) bytes = 1024;
+        NSUInteger localMaxFrames = _maxBufferSize / bytes;
+        suggestedFrames = MIN(suggestedFrames, localMaxFrames);
+    }
+    
+    // 设置合理的范围
+    if (suggestedFrames < 1) suggestedFrames = 1;
+    else if (suggestedFrames > 512) suggestedFrames = 512;
+    
+    _maxBufferCount = suggestedFrames;
 }
 
 - (void)dealloc {
@@ -397,6 +472,11 @@ typedef NS_ENUM(NSUInteger, YYAnimatedImageType) {
     [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationDidReceiveMemoryWarningNotification object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationDidEnterBackgroundNotification object:nil];
     [_link invalidate];
+    
+    // 注销全局缓存
+    if (_animatedImageId) {
+        [[YYAnimatedImageCacheManager sharedManager] unregisterAnimatedImage:_animatedImageId];
+    }
 }
 
 - (BOOL)isAnimating {
@@ -431,7 +511,13 @@ typedef NS_ENUM(NSUInteger, YYAnimatedImageType) {
 - (void)didReceiveMemoryWarning:(NSNotification *)notification {
     [_requestQueue cancelAllOperations];
     [_requestQueue addOperationWithBlock: ^{
-        _incrBufferCount = -60 - (int)(arc4random() % 120); // about 1~3 seconds to grow back..
+        // 通知全局缓存管理器处理内存警告
+        [[YYAnimatedImageCacheManager sharedManager] handleMemoryWarning];
+        
+        // 重新计算缓存大小
+        [self calcMaxBufferCount];
+        
+        // 清理当前缓存，保留下一帧
         NSNumber *next = @((_curIndex + 1) % _totalFrameCount);
         LOCK(
              NSArray * keys = _buffer.allKeys;
@@ -440,6 +526,10 @@ typedef NS_ENUM(NSUInteger, YYAnimatedImageType) {
                      [_buffer removeObjectForKey:key];
                  }
              }
+             
+             // 更新全局缓存管理器中的缓存使用情况
+             [[YYAnimatedImageCacheManager sharedManager] updateAnimatedImageCache:self.animatedImageId
+                                                                   cachedFrameCount:_buffer.count];
         )//LOCK
     }];
 }
@@ -523,6 +613,10 @@ typedef NS_ENUM(NSUInteger, YYAnimatedImageType) {
         operation.curImage = image;
         [_requestQueue addOperation:operation];
     }
+    
+    // 更新全局缓存管理器中的缓存使用情况
+    [[YYAnimatedImageCacheManager sharedManager] updateAnimatedImageCache:self.animatedImageId
+                                                          cachedFrameCount:buffer.count];
 }
 
 - (void)displayLayer:(CALayer *)layer {
