@@ -18,6 +18,7 @@ FOUNDATION_EXPORT const unsigned char YYImageVersionString[];
 #import <YYImage/YYSpriteSheetImage.h>
 #import <YYImage/YYImageCoder.h>
 #import <YYImage/YYAnimatedImageView.h>
+#import <YYImage/YYAnimatedImageGlobalCache.h>
 #elif __has_include(<YYWebImage/YYImage.h>)
 #import <YYWebImage/YYFrameImage.h>
 #import <YYWebImage/YYSpriteSheetImage.h>
@@ -28,6 +29,7 @@ FOUNDATION_EXPORT const unsigned char YYImageVersionString[];
 #import "YYSpriteSheetImage.h"
 #import "YYImageCoder.h"
 #import "YYAnimatedImageView.h"
+#import "YYAnimatedImageGlobalCache.h"
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
