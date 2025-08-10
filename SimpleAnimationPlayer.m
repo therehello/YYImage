@@ -13,7 +13,6 @@
 
 @implementation SimpleAnimationPlayer
 
-@synthesize priority = _priority;
 @synthesize currentBufferSize = _currentBufferSize;
 
 - (instancetype)initWithAnimationPath:(NSString *)path {
@@ -29,7 +28,6 @@
         _maxBufferSize = 10 * 1024 * 1024; // 默认10MB
         _frameSize = frameSize;
         _frameRate = frameRate;
-        _priority = 5; // 默认中等优先级
         
         // 注册到全局管理器
         [[AnimationManager sharedManager] registerPlayer:self];
@@ -104,11 +102,11 @@
     // 添加新帧
     [self.frameBuffer appendData:frameData];
     
-    NSLog(@"Player %p: Buffer size: %.2fMB / %.2fMB (priority=%lu)", 
+    NSLog(@"Player %p: Buffer size: %.2fMB / %.2fMB (usage: %.1f%%)", 
           self, 
           self.frameBuffer.length / 1024.0 / 1024.0,
           self.maxBufferSize / 1024.0 / 1024.0,
-          (unsigned long)self.priority);
+          (self.frameBuffer.length * 100.0) / self.maxBufferSize);
 }
 
 #pragma mark - AnimationPlayerProtocol

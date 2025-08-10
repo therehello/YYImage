@@ -168,159 +168,158 @@
     NSUInteger playerCount = self.players.count;
     if (playerCount == 0) return;
     
-    // 计算总可用缓存
-    NSUInteger totalAvailableCache = [self calculateTotalAvailableCache];
-    
-    // 收集播放器信息并计算权重
-    NSMutableArray *playerInfos = [NSMutableArray array];
-    CGFloat totalWeight = 0;
-    
+    // 计算当前实际使用的总缓存
+    NSUInteger totalUsedCache = 0;
     @synchronized (self.players) {
         for (id<AnimationPlayerProtocol> player in self.players) {
-            // 计算每个播放器的权重
-            CGFloat weight = [self calculateWeightForPlayer:player];
-            totalWeight += weight;
-            
-            [playerInfos addObject:@{
-                @"player": player,
-                @"weight": @(weight),
-                @"minBuffer": @([self calculateMinBufferForPlayer:player]),
-                @"idealBuffer": @([self calculateIdealBufferForPlayer:player])
-            }];
+            totalUsedCache += player.currentBufferSize;
         }
     }
     
-    // 第一轮：确保每个播放器至少获得最小缓存
-    NSUInteger remainingCache = totalAvailableCache;
-    for (NSDictionary *info in playerInfos) {
-        NSUInteger minBuffer = [info[@"minBuffer"] unsignedIntegerValue];
-        remainingCache = (remainingCache > minBuffer) ? (remainingCache - minBuffer) : 0;
-    }
+    // 根据内存压力计算可用缓存上限
+    NSUInteger maxTotalCache = [self calculateMaxTotalCache];
     
-    // 第二轮：根据权重分配剩余缓存
-    for (NSDictionary *info in playerInfos) {
-        id<AnimationPlayerProtocol> player = info[@"player"];
-        CGFloat weight = [info[@"weight"] floatValue];
-        NSUInteger minBuffer = [info[@"minBuffer"] unsignedIntegerValue];
-        NSUInteger idealBuffer = [info[@"idealBuffer"] unsignedIntegerValue];
-        
-        // 基础分配 = 最小缓存 + 按权重分配的额外缓存
-        NSUInteger extraCache = 0;
-        if (totalWeight > 0 && remainingCache > 0) {
-            extraCache = (NSUInteger)(remainingCache * weight / totalWeight);
+    // 如果当前使用已接近上限，需要收缩
+    BOOL needShrink = (totalUsedCache > maxTotalCache * 0.9);
+    
+    // 计算每个播放器的缓存配额
+    @synchronized (self.players) {
+        for (id<AnimationPlayerProtocol> player in self.players) {
+            NSUInteger newBufferSize = [self calculateBufferSizeForPlayer:player 
+                                                        withTotalCache:maxTotalCache 
+                                                           playerCount:playerCount
+                                                            needShrink:needShrink];
+            [player updateMaxBufferSize:newBufferSize];
         }
-        
-        NSUInteger allocatedCache = minBuffer + extraCache;
-        
-        // 不超过理想缓存大小
-        allocatedCache = MIN(allocatedCache, idealBuffer);
-        
-        // 更新播放器缓存
-        [player updateMaxBufferSize:allocatedCache];
-        
-        NSLog(@"Player %p: allocated %.2fMB (priority=%lu, weight=%.2f)",
-              player,
-              allocatedCache / 1024.0 / 1024.0,
-              (unsigned long)player.priority,
-              weight);
     }
     
     // 更新解码队列并发数
     [self updateDecodeConcurrency];
+    
+    NSLog(@"Cache strategy updated: %lu players, total used: %.2fMB / %.2fMB",
+          (unsigned long)playerCount,
+          totalUsedCache / 1024.0 / 1024.0,
+          maxTotalCache / 1024.0 / 1024.0);
 }
 
-- (NSUInteger)calculateTotalAvailableCache {
+- (NSUInteger)calculateMaxTotalCache {
     NSUInteger baseCache = 0;
     
     switch (self.memoryPressure) {
         case MemoryPressureLevelNormal:
-            // 内存充足，可以使用较多缓存
-            baseCache = 200 * 1024 * 1024; // 200MB total
+            // 内存充足，但采用渐进式策略
+            // 初始不分配太多，根据实际使用情况逐步增加
+            baseCache = 100 * 1024 * 1024; // 100MB total (而不是200MB)
             break;
             
         case MemoryPressureLevelWarning:
             // 内存警告
             if (self.cpuLoad == CPULoadLevelHigh) {
-                // CPU负载高，增加缓存减少解码
-                baseCache = 100 * 1024 * 1024; // 100MB total
-            } else {
-                // CPU负载低，可以减少缓存
                 baseCache = 60 * 1024 * 1024; // 60MB total
+            } else {
+                baseCache = 40 * 1024 * 1024; // 40MB total
             }
             break;
             
         case MemoryPressureLevelCritical:
             // 内存严重不足
-            baseCache = 30 * 1024 * 1024; // 30MB total
+            baseCache = 20 * 1024 * 1024; // 20MB total
             break;
     }
     
     return baseCache;
 }
 
-- (CGFloat)calculateWeightForPlayer:(id<AnimationPlayerProtocol>)player {
-    // 基础权重由优先级决定
-    CGFloat weight = (player.priority + 1) / 11.0; // 归一化到 0.09 - 1.0
+- (NSUInteger)calculateBufferSizeForPlayer:(id<AnimationPlayerProtocol>)player
+                            withTotalCache:(NSUInteger)totalCache
+                               playerCount:(NSUInteger)playerCount
+                                needShrink:(BOOL)needShrink {
     
-    // 根据帧率调整权重（高帧率需要更多缓存）
-    CGFloat frameRateFactor = 1.0;
+    // 基础分配：平均分配
+    NSUInteger baseAllocation = totalCache / playerCount;
+    
+    // 根据帧特征调整
+    CGFloat adjustmentFactor = 1.0;
+    
+    // 帧大小调整因子
+    if (player.frameSize > 500 * 1024) {
+        adjustmentFactor *= 1.2; // 大帧需要更多缓存
+    } else if (player.frameSize < 50 * 1024) {
+        adjustmentFactor *= 0.8; // 小帧需要较少缓存
+    }
+    
+    // 帧率调整因子
     if (player.frameRate > 30) {
-        frameRateFactor = 1.2;
-    } else if (player.frameRate > 60) {
-        frameRateFactor = 1.5;
+        adjustmentFactor *= 1.1;
+    } else if (player.frameRate < 15) {
+        adjustmentFactor *= 0.9;
     }
     
-    // 根据帧大小调整权重（大帧需要更多缓存）
-    CGFloat frameSizeFactor = 1.0;
-    NSUInteger frameSize = player.frameSize;
-    if (frameSize > 500 * 1024) { // > 500KB
-        frameSizeFactor = 1.3;
-    } else if (frameSize > 1024 * 1024) { // > 1MB
-        frameSizeFactor = 1.5;
+    NSUInteger adjustedAllocation = (NSUInteger)(baseAllocation * adjustmentFactor);
+    
+    // 计算最小和最大边界
+    NSUInteger minBuffer = [self calculateMinBufferForPlayer:player];
+    NSUInteger maxBuffer = [self calculateMaxBufferForPlayer:player];
+    
+    // 应用边界限制
+    adjustedAllocation = MAX(adjustedAllocation, minBuffer);
+    adjustedAllocation = MIN(adjustedAllocation, maxBuffer);
+    
+    // 如果需要收缩，渐进式减少
+    if (needShrink && player.currentBufferSize > adjustedAllocation) {
+        // 逐步减少，每次减少20%
+        NSUInteger targetSize = player.currentBufferSize * 0.8;
+        adjustedAllocation = MAX(targetSize, adjustedAllocation);
     }
     
-    // 根据当前缓存使用率调整权重
-    CGFloat usageRatio = 1.0;
-    if (player.maxBufferSize > 0) {
-        usageRatio = (CGFloat)player.currentBufferSize / player.maxBufferSize;
-        // 如果缓存使用率高，说明需要更多缓存
-        if (usageRatio > 0.8) {
-            weight *= 1.2;
+    // 渐进式增长策略
+    if (!needShrink && player.maxBufferSize < adjustedAllocation) {
+        // 检查当前缓存使用率
+        CGFloat usageRate = 0;
+        if (player.maxBufferSize > 0) {
+            usageRate = (CGFloat)player.currentBufferSize / player.maxBufferSize;
+        }
+        
+        // 只有当使用率超过70%时才增加缓存
+        if (usageRate > 0.7) {
+            // 每次增长50%，但不超过目标值
+            NSUInteger newSize = player.maxBufferSize * 1.5;
+            adjustedAllocation = MIN(newSize, adjustedAllocation);
+        } else {
+            // 使用率低，保持当前大小
+            adjustedAllocation = player.maxBufferSize;
         }
     }
     
-    return weight * frameRateFactor * frameSizeFactor;
+    return adjustedAllocation;
 }
 
 - (NSUInteger)calculateMinBufferForPlayer:(id<AnimationPlayerProtocol>)player {
-    // 最小缓存应该能存储一定数量的帧
-    NSUInteger minFrames = 10; // 至少缓存10帧
-    
-    // 内存严重不足时减少最小帧数
-    if (self.memoryPressure == MemoryPressureLevelCritical) {
-        minFrames = 5;
+    // 最小缓存：至少能存储5-10帧
+    NSUInteger minFrames = 5;
+    if (self.memoryPressure != MemoryPressureLevelCritical) {
+        minFrames = 10;
     }
     
     NSUInteger minBuffer = player.frameSize * minFrames;
-    
     // 确保最小1MB
     return MAX(minBuffer, 1024 * 1024);
 }
 
-- (NSUInteger)calculateIdealBufferForPlayer:(id<AnimationPlayerProtocol>)player {
-    // 理想缓存能存储一定时长的动画
-    NSUInteger idealSeconds = 2; // 理想情况缓存2秒
+- (NSUInteger)calculateMaxBufferForPlayer:(id<AnimationPlayerProtocol>)player {
+    // 最大缓存：限制单个播放器不能占用过多内存
+    // 根据内存压力设置不同上限
+    NSUInteger maxBuffer = 30 * 1024 * 1024; // 30MB
     
     if (self.memoryPressure == MemoryPressureLevelWarning) {
-        idealSeconds = 1;
+        maxBuffer = 20 * 1024 * 1024; // 20MB
     } else if (self.memoryPressure == MemoryPressureLevelCritical) {
-        idealSeconds = 0.5;
+        maxBuffer = 10 * 1024 * 1024; // 10MB
     }
     
-    NSUInteger idealBuffer = player.frameSize * player.frameRate * idealSeconds;
-    
-    // 上限50MB per player
-    return MIN(idealBuffer, 50 * 1024 * 1024);
+    // 或者最多存储2秒的动画
+    NSUInteger twoSecondsBuffer = player.frameSize * player.frameRate * 2;
+    return MIN(maxBuffer, twoSecondsBuffer);
 }
 
 - (void)updateDecodeConcurrency {
@@ -329,11 +328,11 @@
     switch (self.cpuLoad) {
         case CPULoadLevelLow:
             // CPU负载低，可以增加并发
-            maxConcurrent = (self.memoryPressure == MemoryPressureLevelCritical) ? 8 : 6;
+            maxConcurrent = (self.memoryPressure == MemoryPressureLevelCritical) ? 6 : 4;
             break;
             
         case CPULoadLevelMedium:
-            maxConcurrent = 4;
+            maxConcurrent = 3;
             break;
             
         case CPULoadLevelHigh:

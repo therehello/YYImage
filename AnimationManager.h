@@ -7,7 +7,6 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, assign, readonly) NSUInteger currentBufferSize;  // 当前缓存大小
 @property (nonatomic, assign, readonly) NSUInteger frameSize;         // 单帧大小
 @property (nonatomic, assign, readonly) NSUInteger frameRate;         // 帧率
-@property (nonatomic, assign) NSUInteger priority;                    // 优先级 (0-10, 10最高)
 
 - (void)updateMaxBufferSize:(NSUInteger)newSize;
 @end
