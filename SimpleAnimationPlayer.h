@@ -9,6 +9,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, strong, readonly) NSMutableData *frameBuffer;
 
 - (instancetype)initWithAnimationPath:(NSString *)path;
+- (instancetype)initWithAnimationPath:(NSString *)path frameSize:(NSUInteger)frameSize frameRate:(NSUInteger)frameRate;
 - (void)startPlaying;
 - (void)stopPlaying;
 
