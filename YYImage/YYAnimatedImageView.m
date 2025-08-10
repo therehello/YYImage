@@ -11,6 +11,7 @@
 
 #import "YYAnimatedImageView.h"
 #import "YYImageCoder.h"
+#import "YYAnimatedImageGlobalCache.h"
 #import <pthread.h>
 #import <mach/mach.h>
 
@@ -176,18 +177,38 @@ typedef NS_ENUM(NSUInteger, YYAnimatedImageType) {
         @autoreleasepool {
             if (idx >= total) idx = 0;
             if ([self isCancelled]) break;
-            __strong YYAnimatedImageView *view = _view;
-            if (!view) break;
-            LOCK_VIEW(BOOL miss = (view->_buffer[@(idx)] == nil));
-            
-            if (miss) {
-                UIImage *img = [_curImage animatedImageFrameAtIndex:idx];
-                img = img.yy_imageByDecoded;
-                if ([self isCancelled]) break;
-                LOCK_VIEW(view->_buffer[@(idx)] = img ? img : [NSNull null]);
-                view = nil;
-            }
-        }
+                         __strong YYAnimatedImageView *view = _view;
+             if (!view) break;
+             LOCK_VIEW(BOOL miss = (view->_buffer[@(idx)] == nil));
+             
+             if (miss) {
+                 UIImage *img = [_curImage animatedImageFrameAtIndex:idx];
+                 img = img.yy_imageByDecoded;
+                 if ([self isCancelled]) break;
+                 // Before inserting, if global is over budget, evict previous two frames from this view's buffer.
+                 if ([[YYAnimatedImageGlobalCache shared] isOverBudget]) {
+                     LOCK_VIEW(
+                         NSUInteger p1 = (idx + view->_totalFrameCount - 1) % view->_totalFrameCount;
+                         NSUInteger p2 = (idx + view->_totalFrameCount - 2) % view->_totalFrameCount;
+                         if (view->_buffer[@(p1)] && view->_buffer[@(p1)] != (id)[NSNull null]) {
+                             [[YYAnimatedImageGlobalCache shared] removeBytes:(uint64_t)view->_curAnimatedImage.animatedImageBytesPerFrame];
+                         }
+                         if (view->_buffer[@(p2)] && view->_buffer[@(p2)] != (id)[NSNull null]) {
+                             [[YYAnimatedImageGlobalCache shared] removeBytes:(uint64_t)view->_curAnimatedImage.animatedImageBytesPerFrame];
+                         }
+                         [view->_buffer removeObjectForKey:@(p1)];
+                         [view->_buffer removeObjectForKey:@(p2)];
+                     );
+                 }
+                 LOCK_VIEW(
+                     view->_buffer[@(idx)] = img ? img : [NSNull null];
+                     if (img) {
+                         [[YYAnimatedImageGlobalCache shared] addBytes:(uint64_t)view->_curAnimatedImage.animatedImageBytesPerFrame];
+                     }
+                 );
+                 view = nil;
+             }
+}
     }
 }
 @end
@@ -250,6 +271,16 @@ typedef NS_ENUM(NSUInteger, YYAnimatedImageType) {
          if (_buffer.count) {
              NSMutableDictionary *holder = _buffer;
              _buffer = [NSMutableDictionary new];
+             // Calculate how many real frames we are evicting and update global cache usage.
+             NSUInteger realCount = 0;
+             for (id v in holder.allValues) {
+                 if (v != (id)[NSNull null]) realCount++;
+             }
+             uint64_t bpf = (uint64_t)_curAnimatedImage.animatedImageBytesPerFrame;
+             if (bpf == 0) bpf = 1024;
+             if (realCount > 0) {
+                 [[YYAnimatedImageGlobalCache shared] removeBytes:(uint64_t)realCount * bpf];
+             }
              dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
                  // Capture the dictionary to global queue,
                  // release these images in background to avoid blocking UI thread.
@@ -394,6 +425,18 @@ typedef NS_ENUM(NSUInteger, YYAnimatedImageType) {
 
 - (void)dealloc {
     [_requestQueue cancelAllOperations];
+    // Adjust global usage for any remaining frames in buffer
+    LOCK(
+         if (_buffer.count) {
+             NSUInteger realCount = 0;
+             for (id v in _buffer.allValues) {
+                 if (v != (id)[NSNull null]) realCount++;
+             }
+             uint64_t bpf = (uint64_t)_curAnimatedImage.animatedImageBytesPerFrame;
+             if (bpf == 0) bpf = 1024;
+             if (realCount > 0) [[YYAnimatedImageGlobalCache shared] removeBytes:(uint64_t)realCount * bpf];
+         }
+    );
     [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationDidReceiveMemoryWarningNotification object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationDidEnterBackgroundNotification object:nil];
     [_link invalidate];
@@ -429,32 +472,44 @@ typedef NS_ENUM(NSUInteger, YYAnimatedImageType) {
 }
 
 - (void)didReceiveMemoryWarning:(NSNotification *)notification {
-    [_requestQueue cancelAllOperations];
-    [_requestQueue addOperationWithBlock: ^{
-        _incrBufferCount = -60 - (int)(arc4random() % 120); // about 1~3 seconds to grow back..
-        NSNumber *next = @((_curIndex + 1) % _totalFrameCount);
-        LOCK(
-             NSArray * keys = _buffer.allKeys;
-             for (NSNumber * key in keys) {
-                 if (![key isEqualToNumber:next]) { // keep the next frame for smoothly animation
-                     [_buffer removeObjectForKey:key];
-                 }
-             }
-        )//LOCK
-    }];
+         [_requestQueue cancelAllOperations];
+     [_requestQueue addOperationWithBlock: ^{
+         _incrBufferCount = -60 - (int)(arc4random() % 120); // about 1~3 seconds to grow back..
+         NSNumber *next = @((_curIndex + 1) % _totalFrameCount);
+         LOCK(
+              NSArray * keys = _buffer.allKeys;
+              uint64_t bpf = (uint64_t)_curAnimatedImage.animatedImageBytesPerFrame;
+              if (bpf == 0) bpf = 1024;
+              for (NSNumber * key in keys) {
+                  if (![key isEqualToNumber:next]) { // keep the next frame for smoothly animation
+                      id v = _buffer[key];
+                      if (v && v != (id)[NSNull null]) {
+                          [[YYAnimatedImageGlobalCache shared] removeBytes:bpf];
+                      }
+                      [_buffer removeObjectForKey:key];
+                  }
+              }
+         )//LOCK
+     }];
 }
 
 - (void)didEnterBackground:(NSNotification *)notification {
-    [_requestQueue cancelAllOperations];
-    NSNumber *next = @((_curIndex + 1) % _totalFrameCount);
-    LOCK(
-         NSArray * keys = _buffer.allKeys;
-         for (NSNumber * key in keys) {
-             if (![key isEqualToNumber:next]) { // keep the next frame for smoothly animation
-                 [_buffer removeObjectForKey:key];
-             }
-         }
-     )//LOCK
+         [_requestQueue cancelAllOperations];
+     NSNumber *next = @((_curIndex + 1) % _totalFrameCount);
+     LOCK(
+          NSArray * keys = _buffer.allKeys;
+          uint64_t bpf = (uint64_t)_curAnimatedImage.animatedImageBytesPerFrame;
+          if (bpf == 0) bpf = 1024;
+          for (NSNumber * key in keys) {
+              if (![key isEqualToNumber:next]) { // keep the next frame for smoothly animation
+                  id v = _buffer[key];
+                  if (v && v != (id)[NSNull null]) {
+                      [[YYAnimatedImageGlobalCache shared] removeBytes:bpf];
+                  }
+                  [_buffer removeObjectForKey:key];
+              }
+          }
+      )//LOCK
 }
 
 - (void)step:(CADisplayLink *)link {
@@ -489,27 +544,31 @@ typedef NS_ENUM(NSUInteger, YYAnimatedImageType) {
         if (_time > delay) _time = delay; // do not jump over frame
     }
     LOCK(
-         bufferedImage = buffer[@(nextIndex)];
-         if (bufferedImage) {
-             if ((int)_incrBufferCount < _totalFrameCount) {
-                 [buffer removeObjectForKey:@(nextIndex)];
-             }
-             [self willChangeValueForKey:@"currentAnimatedImageIndex"];
-             _curIndex = nextIndex;
-             [self didChangeValueForKey:@"currentAnimatedImageIndex"];
-             _curFrame = bufferedImage == (id)[NSNull null] ? nil : bufferedImage;
-             if (_curImageHasContentsRect) {
-                 _curContentsRect = [image animatedImageContentsRectAtIndex:_curIndex];
-                 [self setContentsRect:_curContentsRect forImage:_curFrame];
-             }
-             nextIndex = (_curIndex + 1) % _totalFrameCount;
-             _bufferMiss = NO;
-             if (buffer.count == _totalFrameCount) {
-                 bufferIsFull = YES;
-             }
-         } else {
-             _bufferMiss = YES;
-         }
+                   bufferedImage = buffer[@(nextIndex)];
+          if (bufferedImage) {
+              if ((int)_incrBufferCount < _totalFrameCount) {
+                  id v = buffer[@(nextIndex)];
+                  if (v && v != (id)[NSNull null]) {
+                      [[YYAnimatedImageGlobalCache shared] removeBytes:(uint64_t)_curAnimatedImage.animatedImageBytesPerFrame];
+                  }
+                  [buffer removeObjectForKey:@(nextIndex)];
+              }
+              [self willChangeValueForKey:@"currentAnimatedImageIndex"];
+              _curIndex = nextIndex;
+              [self didChangeValueForKey:@"currentAnimatedImageIndex"];
+              _curFrame = bufferedImage == (id)[NSNull null] ? nil : bufferedImage;
+              if (_curImageHasContentsRect) {
+                  _curContentsRect = [image animatedImageContentsRectAtIndex:_curIndex];
+                  [self setContentsRect:_curContentsRect forImage:_curFrame];
+              }
+              nextIndex = (_curIndex + 1) % _totalFrameCount;
+              _bufferMiss = NO;
+              if (buffer.count == _totalFrameCount) {
+                  bufferIsFull = YES;
+              }
+          } else {
+              _bufferMiss = YES;
+          }
     )//LOCK
     
     if (!_bufferMiss) {
@@ -580,18 +639,28 @@ typedef NS_ENUM(NSUInteger, YYAnimatedImageType) {
     void (^block)() = ^{
         LOCK(
              [_requestQueue cancelAllOperations];
-             [_buffer removeAllObjects];
-             [self willChangeValueForKey:@"currentAnimatedImageIndex"];
-             _curIndex = currentAnimatedImageIndex;
-             [self didChangeValueForKey:@"currentAnimatedImageIndex"];
-             _curFrame = [_curAnimatedImage animatedImageFrameAtIndex:_curIndex];
-             if (_curImageHasContentsRect) {
-                 _curContentsRect = [_curAnimatedImage animatedImageContentsRectAtIndex:_curIndex];
-             }
-             _time = 0;
-             _loopEnd = NO;
-             _bufferMiss = NO;
-             [self.layer setNeedsDisplay];
+                           // adjust global usage for buffer clear
+              if (_buffer.count) {
+                  NSUInteger realCount = 0;
+                  for (id v in _buffer.allValues) {
+                      if (v != (id)[NSNull null]) realCount++;
+                  }
+                  uint64_t bpf = (uint64_t)_curAnimatedImage.animatedImageBytesPerFrame;
+                  if (bpf == 0) bpf = 1024;
+                  if (realCount > 0) [[YYAnimatedImageGlobalCache shared] removeBytes:(uint64_t)realCount * bpf];
+              }
+              [_buffer removeAllObjects];
+              [self willChangeValueForKey:@"currentAnimatedImageIndex"];
+              _curIndex = currentAnimatedImageIndex;
+              [self didChangeValueForKey:@"currentAnimatedImageIndex"];
+              _curFrame = [_curAnimatedImage animatedImageFrameAtIndex:_curIndex];
+              if (_curImageHasContentsRect) {
+                  _curContentsRect = [_curAnimatedImage animatedImageContentsRectAtIndex:_curIndex];
+              }
+              _time = 0;
+              _loopEnd = NO;
+              _bufferMiss = NO;
+              [self.layer setNeedsDisplay];
         )//LOCK
     };
     
