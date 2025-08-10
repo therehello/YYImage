@@ -80,6 +80,12 @@ NS_ASSUME_NONNULL_BEGIN
  */
 @property (nonatomic) NSUInteger maxBufferSize;
 
+/**
+ 动图唯一标识符，用于全局缓存管理
+ 如果不设置，将使用对象的地址作为标识符
+ */
+@property (nonatomic, copy) NSString *animatedImageId;
+
 @end
 
 
