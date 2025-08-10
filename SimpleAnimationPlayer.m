@@ -24,10 +24,14 @@
     return self;
 }
 
+// 注意：由于管理器持有强引用，不再自动注销
+// 需要手动调用 [[AnimationManager sharedManager] unregisterPlayer:self] 来释放
+/*
 - (void)dealloc {
     // 注销
     [[AnimationManager sharedManager] unregisterPlayer:self];
 }
+*/
 
 - (void)startPlaying {
     self.isPlaying = YES;

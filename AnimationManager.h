@@ -23,6 +23,9 @@ typedef NS_ENUM(NSUInteger, CPULoadLevel) {
 
 + (instancetype)sharedManager;
 
+// 获取所有播放器
+@property (nonatomic, strong, readonly) NSArray<id<AnimationPlayerProtocol>> *allPlayers;
+
 // 注册和注销播放器
 - (void)registerPlayer:(id<AnimationPlayerProtocol>)player;
 - (void)unregisterPlayer:(id<AnimationPlayerProtocol>)player;

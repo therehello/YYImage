@@ -5,7 +5,7 @@
 
 @interface AnimationManager ()
 
-@property (nonatomic, strong) NSMutableSet<id<AnimationPlayerProtocol>> *players;
+@property (nonatomic, strong) NSMutableArray<id<AnimationPlayerProtocol>> *players;
 @property (nonatomic, strong) NSOperationQueue *decodeQueue;
 @property (nonatomic, strong) NSTimer *monitorTimer;
 
@@ -28,7 +28,7 @@
 - (instancetype)init {
     self = [super init];
     if (self) {
-        _players = [NSMutableSet set];
+        _players = [NSMutableArray array];
         _decodeQueue = [[NSOperationQueue alloc] init];
         _decodeQueue.maxConcurrentOperationCount = 2; // 默认并发数
         
@@ -41,11 +41,21 @@
     [self stopMonitoring];
 }
 
+#pragma mark - Properties
+
+- (NSArray<id<AnimationPlayerProtocol>> *)allPlayers {
+    @synchronized (self.players) {
+        return [self.players copy];
+    }
+}
+
 #pragma mark - Player Management
 
 - (void)registerPlayer:(id<AnimationPlayerProtocol>)player {
     @synchronized (self.players) {
-        [self.players addObject:player];
+        if (![self.players containsObject:player]) {
+            [self.players addObject:player];
+        }
     }
     [self updateCacheStrategy];
 }
